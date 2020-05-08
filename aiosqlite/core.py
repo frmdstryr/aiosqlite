@@ -24,6 +24,7 @@ __all__ = ["connect", "Connection", "Cursor"]
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
 
 LOG = logging.getLogger("aiosqlite")
+TIMEOUT = 60.0
 
 
 IsolationLevel = Optional[Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]]
