@@ -22,10 +22,12 @@ from sqlite3 import (  # pylint: disable=redefined-builtin
 __author__ = "Amethyst Reese"
 from .__version__ import __version__
 from .core import connect, Connection, Cursor
+from .pool import create_pool, Pool
 
 __all__ = [
     "__version__",
     "paramstyle",
+    "create_pool",
     "register_adapter",
     "register_converter",
     "sqlite_version",
@@ -33,6 +35,7 @@ __all__ = [
     "connect",
     "Connection",
     "Cursor",
+    "Pool",
     "Row",
     "Warning",
     "Error",

@@ -37,6 +37,7 @@ from .cursor import Cursor
 __all__ = ["connect", "Connection", "Cursor"]
 
 LOG = logging.getLogger("aiosqlite")
+TIMEOUT = 60.0
 
 
 IsolationLevel = Optional[Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]]
