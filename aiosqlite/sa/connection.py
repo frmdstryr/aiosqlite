@@ -1,11 +1,19 @@
 # ported from:
 # https://github.com/aio-libs/aiopg/blob/master/aiopg/sa/connection.py
+import asyncio
+import logging
+
+from weakref import WeakSet
+from types import TracebackType
+from typing import Any, Optional, Type, Union, TYPE_CHECKING
+
 from sqlalchemy.sql import ClauseElement
 from sqlalchemy.sql.ddl import DDLElement
 from sqlalchemy.sql.dml import UpdateBase
 
+from ..core import Connection, Cursor
 from . import exc
-from ..utils import _SAConnectionContextManager, _TransactionContextManager
+from .utils import ContextManager
 from .result import ResultProxy
 from .transaction import (
     NestedTransaction,
@@ -14,17 +22,41 @@ from .transaction import (
     TwoPhaseTransaction,
 )
 
+if TYPE_CHECKING:
+    from .engine import Engine
+
+log = logging.getLogger("aiosqlite.sa")
 
 class SAConnection:
-    def __init__(self, connection, engine):
-        self._connection = connection
-        self._transaction = None
-        self._savepoint_seq = 0
-        self._engine = engine
-        self._dialect = engine.dialect
-        self._cursor = None
+    _QUERY_COMPILE_KWARGS = (("render_postcompile", True),)
 
-    def execute(self, query, *multiparams, **params):
+    __slots__ = (
+        "_connection",
+        "_transaction",
+        "_savepoint_seq",
+        "_engine",
+        "_dialect",
+        "_cursors",
+        "_query_compile_kwargs",
+        "_echo",
+    )
+
+    def __init__(self, connection: Connection, engine: "Engine"):
+        self._connection: Optional[Connection] = connection
+        self._transaction: Optional[Transaction] = None
+        self._savepoint_seq: int = 0
+        self._engine: Optional["Engine"] = engine
+        self._dialect = engine.dialect
+        self._cursors: WeakSet[Cursor] = WeakSet()
+        self._query_compile_kwargs = dict(self._QUERY_COMPILE_KWARGS)
+        self._echo = engine._pool.echo
+
+    def execute(
+        self,
+        query: Union[str, ClauseElement],
+        *multiparams,
+        **params
+    ) -> "SAConnectionContextManager":
         """Executes a SQL query with optional parameters.
 
         query - a SQL query string or any sqlalchemy expression.
@@ -62,86 +94,124 @@ class SAConnection:
 
         """
         coro = self._execute(query, *multiparams, **params)
-        return _SAConnectionContextManager(coro)
+        return SAConnectionContextManager(coro)
 
-    async def _get_cursor(self):
-        if self._cursor:
-            return self._cursor
+    async def _open_cursor(self) -> Cursor:
+        if self._connection is None:
+            raise exc.ResourceClosedError("This connection is closed.")
+        cursor = await self._connection.cursor()
+        self._cursors.add(cursor)
+        return cursor
 
-        self._cursor = await self._connection.cursor()
-        return self._cursor
+    def _close_cursor(self, cursor: Cursor) -> None:
+        self._cursors.remove(cursor)
+        asyncio.create_task(cursor.close())
 
-    async def _execute(self, query, *multiparams, **params):
-        cursor = await self._get_cursor()
+    async def _execute(
+        self,
+        query: Union[str, ClauseElement],
+        *multiparams,
+        **params
+    ) -> ResultProxy:
+        cursor = await self._open_cursor()
         dp = _distill_params(multiparams, params)
         if len(dp) > 1:
-            raise exc.ArgumentError("aiopg doesn't support executemany")
+            raise exc.ArgumentError("aiosqlite doesn't support executemany")
         elif dp:
             dp = dp[0]
 
         result_map = None
-
         if isinstance(query, str):
-            await cursor.execute(query, dp)
+            pass
         elif isinstance(query, ClauseElement):
-            compiled = query.compile(dialect=self._dialect)
             # parameters = compiled.params
             if not isinstance(query, DDLElement):
+                compiled = query.compile(
+                    dialect=self._dialect,
+                    compile_kwargs=self._query_compile_kwargs
+                )
+
                 if dp and isinstance(dp, (list, tuple)):
                     if isinstance(query, UpdateBase):
-                        dp = {c.key: pval
-                              for c, pval in zip(query.table.c, dp)}
+                        dp = {
+                            c.key: pval for c, pval in zip(query.table.c, dp)
+                        }
                     else:
-                        raise exc.ArgumentError("Don't mix sqlalchemy SELECT "
-                                                "clause with positional "
-                                                "parameters")
+                        raise exc.ArgumentError(
+                            "Don't mix sqlalchemy SELECT "
+                            "clause with positional "
+                            "parameters"
+                        )
 
                 compiled_parameters = [compiled.construct_params(dp)]
                 processed_parameters = []
                 processors = compiled._bind_processors
                 for compiled_params in compiled_parameters:
-                    params = {key: (processors[key](compiled_params[key])
-                                    if key in processors
-                                    else compiled_params[key])
-                              for key in compiled_params}
+                    params = {
+                        key: (
+                            processors[key](compiled_params[key])
+                            if key in processors
+                            else compiled_params[key]
+                        )
+                        for key in compiled_params
+                    }
                     processed_parameters.append(params)
                 post_processed_params = self._dialect.execute_sequence_format(
-                    processed_parameters)
+                    processed_parameters
+                )
 
                 # _result_columns is a private API of Compiled,
                 # but I couldn't find any public API exposing this data.
-                result_map = compiled._result_columns
-
             else:
+                compiled = query.compile(dialect=self._dialect)
                 if dp:
-                    raise exc.ArgumentError("Don't mix sqlalchemy DDL clause "
-                                            "and execution with parameters")
+                    raise exc.ArgumentError(
+                        "Don't mix sqlalchemy DDL clause "
+                        "and execution with parameters"
+                    )
                 post_processed_params = [compiled.construct_params()]
-                result_map = None
-
-            await cursor.execute(str(compiled), post_processed_params[0])
+            result_map = compiled._result_columns
+            query = str(compiled)
+            dp = post_processed_params[0]
+            if dp is not None:
+                dp = tuple(dp.values())
         else:
-            raise exc.ArgumentError("sql statement should be str or "
-                                    "SQLAlchemy data "
-                                    "selection/modification clause")
+            raise exc.ArgumentError(
+                "sql statement should be str or "
+                "SQLAlchemy data "
+                "selection/modification clause"
+            )
 
+        if self._echo:
+            log.debug("%s: %s", query, dp)
+        await cursor.execute(query, dp)
         return ResultProxy(self, cursor, self._dialect, result_map)
 
-    async def scalar(self, query, *multiparams, **params):
+    async def scalar(
+        self,
+        query: Union[str, ClauseElement],
+        *multiparams,
+        **params
+    ) -> Any:
         """Executes a SQL query and returns a scalar value."""
         res = await self.execute(query, *multiparams, **params)
         return await res.scalar()
 
     @property
-    def closed(self):
+    def closed(self) -> bool:
         """The readonly property that returns True if connections is closed."""
         return self.connection is None or self.connection.closed
 
     @property
-    def connection(self):
+    def connection(self) -> Optional[Connection]:
         return self._connection
 
-    def begin(self, isolation_level=None, readonly=False, deferrable=False):
+    def begin(
+        self,
+        isolation_level: Optional[str] = None,
+        readonly: bool = False,
+        deferrable: bool = False
+    ) -> "TransactionContextManager":
         """Begin a transaction and return a transaction handle.
 
         isolation_level - The isolation level of the transaction,
@@ -179,9 +249,14 @@ class SAConnection:
 
         """
         coro = self._begin(isolation_level, readonly, deferrable)
-        return _TransactionContextManager(coro)
+        return TransactionContextManager(coro)
 
-    async def _begin(self, isolation_level, readonly, deferrable):
+    async def _begin(
+        self,
+        isolation_level: Optional[str],
+        readonly: bool,
+        deferrable: bool
+    ) -> Transaction:
         if self._transaction is None:
             self._transaction = RootTransaction(self)
             await self._begin_impl(isolation_level, readonly, deferrable)
@@ -189,38 +264,43 @@ class SAConnection:
         else:
             return Transaction(self, self._transaction)
 
-    async def _begin_impl(self, isolation_level, readonly, deferrable):
-        stmt = 'BEGIN'
+    async def _begin_impl(
+        self,
+        isolation_level: Optional[str],
+        readonly: bool,
+        deferrable: bool
+    ) -> None:
+        stmt = "BEGIN"
         if isolation_level is not None:
-            stmt += ' ISOLATION LEVEL ' + isolation_level
+            stmt += " ISOLATION LEVEL " + isolation_level
         if readonly:
-            stmt += ' READ ONLY'
+            stmt += " READ ONLY"
         if deferrable:
-            stmt += ' DEFERRABLE'
+            stmt += " DEFERRABLE"
 
-        cur = await self._get_cursor()
+        cur = await self._open_cursor()
         try:
             await cur.execute(stmt)
         finally:
             await cur.close()
 
-    async def _commit_impl(self):
-        cur = await self._get_cursor()
+    async def _commit_impl(self) -> None:
+        cur = await self._open_cursor()
         try:
-            await cur.execute('COMMIT')
+            await cur.execute("COMMIT")
         finally:
             await cur.close()
             self._transaction = None
 
-    async def _rollback_impl(self):
-        cur = await self._get_cursor()
+    async def _rollback_impl(self) -> None:
+        cur = await self._open_cursor()
         try:
-            await cur.execute('ROLLBACK')
+            await cur.execute("ROLLBACK")
         finally:
             await cur.close()
             self._transaction = None
 
-    def begin_nested(self):
+    def begin_nested(self) -> "TransactionContextManager":
         """Begin a nested transaction and return a transaction handle.
 
         The returned object is an instance of :class:`.NestedTransaction`.
@@ -232,9 +312,9 @@ class SAConnection:
         transaction of a whole.
         """
         coro = self._begin_nested()
-        return _TransactionContextManager(coro)
+        return TransactionContextManager(coro)
 
-    async def _begin_nested(self):
+    async def _begin_nested(self) -> "Transaction":
         if self._transaction is None:
             self._transaction = RootTransaction(self)
             await self._begin_impl(None, False, False)
@@ -243,34 +323,37 @@ class SAConnection:
             self._transaction._savepoint = await self._savepoint_impl()
         return self._transaction
 
-    async def _savepoint_impl(self, name=None):
+    async def _savepoint_impl(self, name: Optional[str] = None) -> str:
         self._savepoint_seq += 1
-        name = 'aiosqlite_sa_savepoint_%s' % self._savepoint_seq
-
-        cur = await self._get_cursor()
+        name = f"aiosqlite_sa_savepoint_{self._savepoint_seq}"
+        cur = await self._open_cursor()
         try:
-            await cur.execute('SAVEPOINT ' + name)
+            await cur.execute("SAVEPOINT " + name)
             return name
         finally:
-            await cur.close()
+            self._close_cursor(cur)
 
-    async def _rollback_to_savepoint_impl(self, name, parent):
-        cur = await self._get_cursor()
+    async def _rollback_to_savepoint_impl(
+        self,
+        name: str,
+        parent: "Transaction"
+    ) -> None:
+        cur = await self._open_cursor()
         try:
-            await cur.execute('ROLLBACK TO SAVEPOINT ' + name)
+            await cur.execute("ROLLBACK TO SAVEPOINT " + name)
         finally:
-            await cur.close()
+            self._close_cursor(cur)
         self._transaction = parent
 
-    async def _release_savepoint_impl(self, name, parent):
-        cur = await self._get_cursor()
+    async def _release_savepoint_impl(self, name: str, parent: "Transaction") -> None:
+        cur = await self._open_cursor()
         try:
-            await cur.execute('RELEASE SAVEPOINT ' + name)
+            await cur.execute("RELEASE SAVEPOINT " + name)
         finally:
-            await cur.close()
+            self._close_cursor(cur)
         self._transaction = parent
 
-    async def begin_twophase(self, xid=None):
+    async def begin_twophase(self, xid: Any = None) -> TwoPhaseTransaction:
         """Begin a two-phase or XA transaction and return a transaction
         handle.
 
@@ -286,41 +369,42 @@ class SAConnection:
         if self._transaction is not None:
             raise exc.InvalidRequestError(
                 "Cannot start a two phase transaction when a transaction "
-                "is already in progress.")
+                "is already in progress."
+            )
         if xid is None:
             xid = self._dialect.create_xid()
         self._transaction = TwoPhaseTransaction(self, xid)
         await self._begin_impl()
         return self._transaction
 
-    async def _prepare_twophase_impl(self, xid):
-        await self.execute("PREPARE TRANSACTION '%s'" % xid)
+    async def _prepare_twophase_impl(self, xid: str) -> None:
+        await self.execute(f"PREPARE TRANSACTION '{xid}'")
 
-    async def recover_twophase(self):
+    async def recover_twophase(self) -> list:
         """Return a list of prepared twophase transaction ids."""
         result = await self.execute("SELECT gid FROM pg_prepared_xacts")
         return [row[0] for row in result]
 
-    async def rollback_prepared(self, xid, *, is_prepared=True):
+    async def rollback_prepared(self, xid: str, *, is_prepared: bool = True) -> None:
         """Rollback prepared twophase transaction."""
         if is_prepared:
-            await self.execute("ROLLBACK PREPARED '%s'" % xid)
+            await self.execute(f"ROLLBACK PREPARED '{xid}'")
         else:
             await self._rollback_impl()
 
-    async def commit_prepared(self, xid, *, is_prepared=True):
+    async def commit_prepared(self, xid: str, *, is_prepared: bool = True) -> None:
         """Commit prepared twophase transaction."""
         if is_prepared:
-            await self.execute("COMMIT PREPARED '%s'" % xid)
+            await self.execute(f"COMMIT PREPARED '{xid}'")
         else:
             await self._commit_impl()
 
     @property
-    def in_transaction(self):
+    def in_transaction(self) -> bool:
         """Return True if a transaction is in progress."""
         return self._transaction is not None and self._transaction.is_active
 
-    async def close(self):
+    async def close(self) -> None:
         """Close this SAConnection.
 
         This results in a release of the underlying database
@@ -348,7 +432,7 @@ class SAConnection:
         self._engine = None
 
 
-def _distill_params(multiparams, params):
+def _distill_params(multiparams: tuple, params: dict) -> list:
     """Given arguments from the calling form *multiparams, **params,
     return a list of bind parameter structures, usually a list of
     dictionaries.
@@ -366,23 +450,54 @@ def _distill_params(multiparams, params):
     elif len(multiparams) == 1:
         zero = multiparams[0]
         if isinstance(zero, (list, tuple)):
-            if not zero or hasattr(zero[0], '__iter__') and \
-                    not hasattr(zero[0], 'strip'):
+            if (
+                not zero
+                or hasattr(zero[0], "__iter__")
+                and not hasattr(zero[0], "strip")
+            ):
                 # execute(stmt, [{}, {}, {}, ...])
                 # execute(stmt, [(), (), (), ...])
                 return zero
             else:
                 # execute(stmt, ("value", "value"))
                 return [zero]
-        elif hasattr(zero, 'keys'):
+        elif hasattr(zero, "keys"):
             # execute(stmt, {"key":"value"})
             return [zero]
         else:
             # execute(stmt, "value")
             return [[zero]]
+    elif hasattr(multiparams[0], "__iter__") and not hasattr(multiparams[0], "strip"):
+        return multiparams
     else:
-        if (hasattr(multiparams[0], '__iter__') and
-                not hasattr(multiparams[0], 'strip')):
-            return multiparams
-        else:
-            return [multiparams]
+        return [multiparams]
+
+
+class SAConnectionContextManager(ContextManager[ResultProxy]):
+    def __aiter__(self) -> "SAConnectionContextManager":
+        return self
+
+    async def __anext__(self) -> ResultProxy:
+        if self._obj is None:
+            self._obj = await self._coro
+        try:
+            return await self._obj.__anext__()
+        except StopAsyncIteration:
+            await self._obj.close()
+            self._obj = None
+            raise
+
+
+class TransactionContextManager(ContextManager[Transaction]):
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType]
+    ):
+        assert self._obj is not None
+        if exc_type:
+            await self._obj.rollback()
+        elif self._obj.is_active:
+            await self._obj.commit()
+        self._obj = None

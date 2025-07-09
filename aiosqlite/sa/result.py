@@ -4,16 +4,28 @@
 import asyncio
 import weakref
 from collections.abc import Mapping, Sequence
+from typing import Optional, TYPE_CHECKING
 
 from sqlalchemy.sql import expression, sqltypes
 
 from . import exc
 
+from .. import Cursor
+
+if TYPE_CHECKING:
+    from .connection import SAConnection
+
 
 class RowProxy(Mapping):
-    __slots__ = ('_result_proxy', '_row', '_processors', '_keymap')
+    __slots__ = ("_result_proxy", "_row", "_processors", "_keymap")
 
-    def __init__(self, result_proxy, row, processors, keymap):
+    def __init__(
+        self,
+        result_proxy: "ResultProxy",
+        row: tuple,
+        processors,
+        keymap: dict,
+    ):
         """RowProxy objects are constructed by ResultProxy objects."""
         self._result_proxy = result_proxy
         self._row = row
@@ -23,10 +35,10 @@ class RowProxy(Mapping):
     def __iter__(self):
         return iter(self._result_proxy.keys)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._row)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: str):
         try:
             processor, obj, index = self._keymap[key]
         except KeyError:
@@ -47,38 +59,39 @@ class RowProxy(Mapping):
         if index is None:
             raise exc.InvalidRequestError(
                 "Ambiguous column name '%s' in result set! "
-                "try 'use_labels' option on select statement." % key)
+                "try 'use_labels' option on select statement." % key
+            )
         if processor is not None:
             return processor(self._row[index])
         else:
             return self._row[index]
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str):
         try:
             return self[name]
         except KeyError as e:
             raise AttributeError(e.args[0])
 
-    def __contains__(self, key):
+    def __contains__(self, key: str):
         return self._result_proxy._has_key(self._row, key)
 
     __hash__ = None
 
-    def __eq__(self, other):
+    def __eq__(self, other) -> bool:
         if isinstance(other, RowProxy):
             return self.as_tuple() == other.as_tuple()
         elif isinstance(other, Sequence):
             return self.as_tuple() == other
         else:
-            return NotImplemented
+            raise NotImplemented
 
-    def __ne__(self, other):
+    def __ne__(self, other) -> bool:
         return not self == other
 
-    def as_tuple(self):
+    def as_tuple(self) -> tuple:
         return tuple(self[k] for k in self)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return repr(self.as_tuple())
 
 
@@ -101,16 +114,16 @@ class ResultMetaData:
         # `dbapi_type_map` property removed in SQLAlchemy 1.2+.
         # Usage of `getattr` only needed for backward compatibility with
         # older versions of SQLAlchemy.
-        typemap = getattr(dialect, 'dbapi_type_map', {})
+        typemap = getattr(dialect, "dbapi_type_map", {})
 
-        assert dialect.case_sensitive, \
-            "Doesn't support case insensitive database connection"
+        assert (
+            dialect.case_sensitive
+        ), "Doesn't support case insensitive database connection"
 
         # high precedence key values.
         primary_keymap = {}
 
-        assert not dialect.description_encoding, \
-            "psycopg in py3k should not use this"
+        assert not dialect.description_encoding, "psycopg in py3k should not use this"
 
         for i, rec in enumerate(cursor_description):
             colname = rec[0]
@@ -123,7 +136,7 @@ class ResultMetaData:
             name, obj, type_ = (
                 map_column_name.get(colname, colname),
                 None,
-                map_type.get(colname, typemap.get(coltype, sqltypes.NULLTYPE))
+                map_type.get(colname, typemap.get(coltype, sqltypes.NULLTYPE)),
             )
 
             processor = type_._cached_result_processor(dialect, coltype)
@@ -164,7 +177,7 @@ class ResultMetaData:
         map_column_name = {}
         for elem in data_map:
             name = elem[0]
-            priority_name = getattr(elem[2][0], 'key', name)
+            priority_name = getattr(elem[2][0], "key", name)
             map_type[name] = elem[3]  # type column
             map_column_name[name] = priority_name
 
@@ -180,9 +193,9 @@ class ResultMetaData:
         # or colummn('name') constructs to ColumnElements, or after a
         # pickle/unpickle roundtrip
         elif isinstance(key, expression.ColumnElement):
-            if (key._label and key._label in map):
+            if key._label and key._label in map:
                 result = map[key._label]
-            elif (hasattr(key, 'key') and key.key in map):
+            elif hasattr(key, "key") and key.key in map:
                 # match is only on name.
                 result = map[key.key]
             # search extra hard to make sure this
@@ -198,8 +211,9 @@ class ResultMetaData:
         if result is None:
             if raiseerr:
                 raise exc.NoSuchColumnError(
-                    "Could not locate column in row for column '%s'" %
-                    expression._string_or_unprintable(key))
+                    "Could not locate column in row for column '%s'"
+                    % expression._string_or_unprintable(key)
+                )
             else:
                 return None
         else:
@@ -232,16 +246,38 @@ class ResultProxy:
     data using sqlalchemy TypeEngine objects, which are referenced from
     the originating SQL statement that produced this result set.
     """
-
-    def __init__(self, connection, cursor, dialect, result_map=None):
+    __slots__ = (
+        "__weakref__",
+        "_dialect",
+        "_result_map",
+        "_cursor",
+        "_connection",
+        "_rowcount",
+        "_lastrowid",
+        "_metadata",
+        "_weak"
+    )
+    def __init__(
+        self,
+        connection: "SAConnection",
+        cursor: Cursor,
+        dialect,
+        result_map: Optional[dict] = None
+    ):
         self._dialect = dialect
-        self._result_map = result_map
+        self._result_map: Optional[ResultMetaData] = result_map
         self._cursor = cursor
         self._connection = connection
-        self._rowcount = cursor.rowcount
-        self._metadata = None
-        self._weak = None
-        asyncio.create_task(self._init_metadata())
+        self._rowcount: int = cursor.rowcount
+        self._lastrowid = cursor.lastrowid
+        cursor_description = cursor.description
+        if cursor_description is not None:
+            self._metadata = ResultMetaData(self, cursor_description)
+            self._weak = weakref.ref(self, lambda wr: self.close())
+        else:
+            self._metadata = None
+            self._weak = None
+            self.close()
 
     @property
     def dialect(self):
@@ -249,10 +285,14 @@ class ResultProxy:
         return self._dialect
 
     @property
-    def cursor(self):
+    def cursor(self) -> Cursor:
         return self._cursor
 
-    def keys(self):
+    @property
+    def lastrowid(self) -> int:
+        return self._lastrowid
+
+    def keys(self) -> tuple:
         """Return the current set of string keys for rows."""
         if self._metadata:
             return tuple(self._metadata.keys)
@@ -260,7 +300,7 @@ class ResultProxy:
             return ()
 
     @property
-    def rowcount(self):
+    def rowcount(self) -> int:
         """Return the 'rowcount' for this result.
 
         The 'rowcount' reports the number of rows *matched*
@@ -290,17 +330,8 @@ class ResultProxy:
         """
         return self._rowcount
 
-    async def _init_metadata(self):
-        cursor_description = self.cursor.description
-        if cursor_description is not None:
-            self._metadata = ResultMetaData(self, cursor_description)
-            self._weak = weakref.ref(self, lambda wr: self.cursor.close())
-        else:
-            await self.close()
-            self._weak = None
-
     @property
-    def returns_rows(self):
+    def returns_rows(self) -> bool:
         """True if this ResultProxy returns rows.
 
         I.e. if it is legal to call the methods .fetchone(),
@@ -308,7 +339,7 @@ class ResultProxy:
         """
         return self._metadata is not None
 
-    async def close(self):
+    def close(self) -> None:
         """Close this ResultProxy.
 
         Closes the underlying DBAPI cursor corresponding to the execution.
@@ -326,8 +357,8 @@ class ResultProxy:
         * cursor.description is None.
         """
 
-        if self.cursor is not None:
-            await self.cursor.close()
+        if self._cursor is not None:
+            self._connection._close_cursor(self._cursor)
             # allow consistent errors
             self._cursor = None
             self._weak = None
@@ -339,24 +370,21 @@ class ResultProxy:
         ret = await self.fetchone()
         if ret is not None:
             return ret
-        else:
-            raise StopAsyncIteration
+        raise StopAsyncIteration
 
     def _non_result(self):
         if self._metadata is None:
             raise exc.ResourceClosedError(
                 "This result object does not return rows. "
-                "It has been closed automatically.")
-        else:
-            raise exc.ResourceClosedError("This result object is closed.")
+                "It has been closed automatically."
+            )
+        raise exc.ResourceClosedError("This result object is closed.")
 
     def _process_rows(self, rows):
-        process_row = RowProxy
         metadata = self._metadata
         keymap = metadata._keymap
         processors = metadata._processors
-        return [process_row(metadata, row, processors, keymap)
-                for row in rows]
+        return [RowProxy(metadata, row, processors, keymap) for row in rows]
 
     async def fetchall(self):
         """Fetch all rows, just like DB-API cursor.fetchall()."""
@@ -366,7 +394,7 @@ class ResultProxy:
             self._non_result()
         else:
             res = self._process_rows(rows)
-            await self.close()
+            self.close()
             return res
 
     async def fetchone(self):
@@ -383,10 +411,10 @@ class ResultProxy:
             if row is not None:
                 return self._process_rows([row])[0]
             else:
-                await self.close()
+                self.close()
                 return None
 
-    async def fetchmany(self, size=None):
+    async def fetchmany(self, size: Optional[int] = None):
         """Fetch many rows, just like DB-API
         cursor.fetchmany(size=cursor.arraysize).
 
@@ -394,16 +422,13 @@ class ResultProxy:
         Else the cursor is automatically closed and an empty list is returned.
         """
         try:
-            if size is None:
-                rows = await self.cursor.fetchmany()
-            else:
-                rows = await self.cursor.fetchmany(size)
+            rows = await self.cursor.fetchmany(size)
         except AttributeError:
             self._non_result()
         else:
             res = self._process_rows(rows)
             if len(res) == 0:
-                await self.close()
+                self.close()
             return res
 
     async def first(self):
@@ -416,7 +441,7 @@ class ResultProxy:
         try:
             return await self.fetchone()
         finally:
-            await self.close()
+            self.close()
 
     async def scalar(self):
         """Fetch the first column of the first row, and close the result set.
@@ -426,5 +451,4 @@ class ResultProxy:
         row = await self.first()
         if row is not None:
             return row[0]
-        else:
-            return None
+        return None

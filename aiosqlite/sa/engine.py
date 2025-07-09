@@ -4,21 +4,24 @@ import json
 import asyncio
 
 import aiosqlite
+from pathlib import Path
+from typing import Any, Union
 
 from ..core import TIMEOUT
-from ..utils import _PoolAcquireContextManager, _PoolContextManager
 from .connection import SAConnection
 from .exc import InvalidRequestError
+from .pool import create_pool, PoolAcquireContextManager, PoolContextManager
 
 try:
     from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
 except ImportError:  # pragma: no cover
-    raise ImportError('aiosqlite.sa requires sqlalchemy')
+    raise ImportError("aiosqlite.sa requires sqlalchemy")
 
 
 def get_dialect(json_serializer=json.dumps, json_deserializer=lambda x: x):
-    dialect = SQLiteDialect_pysqlite(json_serializer=json_serializer,
-                                     json_deserializer=json_deserializer)
+    dialect = SQLiteDialect_pysqlite(
+        json_serializer=json_serializer, json_deserializer=json_deserializer
+    )
 
     return dialect
 
@@ -26,8 +29,16 @@ def get_dialect(json_serializer=json.dumps, json_deserializer=lambda x: x):
 _dialect = get_dialect()
 
 
-def create_engine(dsn=None, *, minsize=1, maxsize=10, dialect=_dialect,
-                  timeout=TIMEOUT, pool_recycle=-1, **kwargs):
+def create_engine(
+    database: Union[str, Path],
+    *,
+    minsize: int = 1,
+    maxsize: int = 10,
+    dialect=_dialect,
+    timeout: float = TIMEOUT,
+    pool_recycle: int = -1,
+    **kwargs: Any
+):
     """A coroutine for Engine creation.
 
     Returns Engine instance with embedded connection pool.
@@ -35,22 +46,40 @@ def create_engine(dsn=None, *, minsize=1, maxsize=10, dialect=_dialect,
     The pool has *minsize* opened connections to PostgreSQL server.
     """
 
-    coro = _create_engine(dsn=dsn, minsize=minsize, maxsize=maxsize,
-                          dialect=dialect, timeout=timeout,
-                          pool_recycle=pool_recycle, **kwargs)
-    return _EngineContextManager(coro)
+    coro = _create_engine(
+        database=database,
+        minsize=minsize,
+        maxsize=maxsize,
+        dialect=dialect,
+        timeout=timeout,
+        pool_recycle=pool_recycle,
+        **kwargs
+    )
+    return EngineContextManager(coro)
 
 
-async def _create_engine(dsn=None, *, minsize=1, maxsize=10, dialect=_dialect,
-                         timeout=TIMEOUT, pool_recycle=-1, **kwargs):
+async def _create_engine(
+    database: Union[str, Path],
+    *,
+    minsize: int,
+    maxsize: int,
+    dialect,
+    timeout: float,
+    pool_recycle: int,
+    **kwargs: Any
+):
 
-    pool = await aiosqlite.create_pool(
-        dsn, minsize=minsize, maxsize=maxsize,
-        timeout=timeout, pool_recycle=pool_recycle, **kwargs
+    pool = await create_pool(
+        database,
+        minsize=minsize,
+        maxsize=maxsize,
+        timeout=timeout,
+        pool_recycle=pool_recycle,
+        **kwargs
     )
     conn = await pool.acquire()
     try:
-        return Engine(dialect, pool, dsn)
+        return Engine(dialect, pool, database)
     finally:
         await pool.release(conn)
 
@@ -136,25 +165,23 @@ class Engine:
     def acquire(self):
         """Get a connection from pool."""
         coro = self._acquire()
-        return _EngineAcquireContextManager(coro, self)
+        return EngineAcquireContextManager(coro, self)
 
-    async def _acquire(self):
+    async def _acquire(self) -> SAConnection:
         raw = await self._pool.acquire()
-        conn = SAConnection(raw, self)
-        return conn
+        return SAConnection(raw, self)
 
-    def release(self, conn):
+    def release(self, conn: SAConnection):
         """Revert back connection to pool."""
         if conn.in_transaction:
-            raise InvalidRequestError("Cannot release a connection with "
-                                      "not finished transaction")
+            raise InvalidRequestError(
+                "Cannot release a connection with not finished transaction"
+            )
         raw = conn.connection
-        fut = asyncio.create_task(self._pool.release(raw))
-        return fut
+        return asyncio.create_task(self._pool.release(raw))
 
     def __enter__(self):
-        raise RuntimeError(
-            '"await" should be used as context manager expression')
+        raise RuntimeError('"await" should be used as context manager expression')
 
     def __exit__(self, *args):
         # This must exist because __enter__ exists, even though that
@@ -175,7 +202,7 @@ class Engine:
         #     finally:
         #         engine.release(conn)
         conn = yield from self._acquire().__await__()
-        return _ConnectionContextManager(self, conn)
+        return ConnectionContextManager(self, conn)
 
     async def __aenter__(self):
         return self
@@ -185,11 +212,11 @@ class Engine:
         await self.wait_closed()
 
 
-_EngineContextManager = _PoolContextManager
-_EngineAcquireContextManager = _PoolAcquireContextManager
+EngineContextManager = PoolContextManager
+EngineAcquireContextManager = PoolAcquireContextManager
 
 
-class _ConnectionContextManager:
+class ConnectionContextManager:
     """Context manager.
 
     This enables the following idiom for acquiring and releasing a
@@ -204,7 +231,7 @@ class _ConnectionContextManager:
             <block>
     """
 
-    __slots__ = ('_engine', '_conn')
+    __slots__ = ("_engine", "_conn")
 
     def __init__(self, engine, conn):
         self._engine = engine
